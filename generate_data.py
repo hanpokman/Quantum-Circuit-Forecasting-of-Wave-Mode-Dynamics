@@ -69,5 +69,9 @@ class SpectralOcean:
         self.omega = np.sqrt(GRAVITY * k) # redefine
 
 
-
+    def height(self, t):
+        """eta [n, n] float32 at time t (real by Hermitian construction)."""
+        ph = np.exp(1j * self.omega * t)
+        hk = self.h0 * ph + self.h0_conj_neg * np.conj(ph)
+        return np.real(np.fft.ifft2(hk)).astype(np.float32) * self.n * self.n # convert to 3D
 
