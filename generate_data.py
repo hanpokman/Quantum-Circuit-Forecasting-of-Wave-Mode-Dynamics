@@ -75,3 +75,104 @@ class SpectralOcean:
         hk = self.h0 * ph + self.h0_conj_neg * np.conj(ph)
         return np.real(np.fft.ifft2(hk)).astype(np.float32) * self.n * self.n # convert to 3D
 
+
+def simulate_wave_field(n_episodes, # uses SpectralOcean object to generate different ocean simulations
+                        grid_size=GRID,
+                        n_timesteps=EP_LEN,
+                        dt=DT,
+                        seed=None,
+                        wind_speed_range=WIND_SPEED_RANGE,
+                        wind_dir_range=WIND_DIR_RANGE,
+                        spectrum="pm"):
+    rng = np.random.default_rng(seed)
+    eta = np.empty((n_episodes, n_timesteps, grid_size, grid_size), np.float32)
+    winds = np.empty((n_episodes, 2), np.float32)
+    for e in range(n_episodes):
+        u = rng.uniform(*wind_speed_range)
+        th = rng.uniform(*wind_dir_range)
+        ocean = SpectralOcean(u, th, rng, n=grid_size, spectrum=spectrum)
+        t0 = rng.uniform(0, 100)
+        for t in range(n_timesteps):
+            eta[e, t] = ocean.height(t0 + t * dt)
+        winds[e] = u, th
+    return eta, winds
+
+
+def _kept_indices(grid=GRID):# returns which 64 modes to keep
+    """(rows, cols) index arrays of the kept half-plane band, C-order of c."""
+    rows = np.r_[KY_LO % grid:grid, 0:KY_HI]      # ky = -3..-1, 0..4
+    cols = np.arange(KX_MAX)                      # kx = 0..7
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+    return rr.reshape(-1), cc.reshape(-1)
+
+
+def extract_fourier_modes(eta, m=M_MODES): # extracts the 64 modes
+    """ Wave --> Modes """
+    grid = eta.shape[-1]
+    f = np.fft.fft2(eta) / (grid * grid)
+    rr, cc = _kept_indices(grid)
+    c = f[..., rr, cc]
+    assert c.shape[-1] == m
+    return c.astype(np.complex64)
+
+def modes_to_field(c, grid=GRID):
+    """
+
+    the reverse. 64 numbers in → wave picture out (4096 numbers).
+    """
+    rr, cc = _kept_indices(grid)
+    f = np.zeros(c.shape[:-1] + (grid, grid), np.complex64)
+    f[..., rr, cc] = c
+    kept = set(zip(rr.tolist(), cc.tolist()))
+    for r, col in kept:
+        mr, mc = (-r) % grid, (-col) % grid
+        if (mr, mc) not in kept:
+            f[..., mr, mc] = np.conj(f[..., r, col])
+    return (np.real(np.fft.ifft2(f)) * grid * grid).astype(np.float32)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="data/waves.npz")
+    ap.add_argument("--episodes", type=int, default=200)
+    ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--test-frac", type=float, default=0.1)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--wind-speed", type=float, nargs=2, default=WIND_SPEED_RANGE,
+                    help="override wind speed range (generalization check)")
+    ap.add_argument("--spectrum", default="pm", choices=["pm", "jonswap"],
+                    help="wave spectrum family (jonswap: fetch-limited, "
+                         "peakier — another distribution-shift test set)")
+
+    a = ap.parse_args()
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+
+    rng = np.random.default_rng(a.seed)
+    n_val = max(1, int(a.episodes * a.val_frac))
+    n_test = max(1, int(a.episodes * a.test_frac))
+    n_train = a.episodes - n_val - n_test
+
+    c_all = np.empty((a.episodes, EP_LEN, M_MODES), np.complex64)
+    winds = np.empty((a.episodes, 2), np.float32)
+    for e in range(a.episodes):  # stream episodes to bound memory
+        eta, w = simulate_wave_field(1, seed=rng.integers(2 ** 31),
+                                     wind_speed_range=tuple(a.wind_speed),
+                                     spectrum=a.spectrum)
+        c_all[e] = extract_fourier_modes(eta[0])
+        winds[e] = w[0]
+        if (e + 1) % 20 == 0:
+            print(f"episode {e + 1}/{a.episodes}")
+
+    perm = rng.permutation(a.episodes)  # split BY EPISODE, never by frame
+    tr, va, te = np.split(perm, [n_train, n_train + n_val])
+    np.savez_compressed(
+        a.out,
+        c_train=c_all[tr], c_val=c_all[va], c_test=c_all[te],
+        winds_train=winds[tr], winds_val=winds[va], winds_test=winds[te],
+        grid_size=GRID, M=M_MODES, dt=DT, dx=DX, gravity=GRAVITY,
+        kx_max=KX_MAX, ky_lo=KY_LO, ky_hi=KY_HI)
+    print(f"wrote {a.out}: train {n_train} / val {n_val} / test {n_test} episodes, "
+          f"T={EP_LEN}, M={M_MODES}")
+
+
+if __name__ == "__main__":
+    main()
