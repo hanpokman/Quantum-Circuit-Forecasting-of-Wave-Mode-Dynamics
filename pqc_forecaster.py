@@ -115,3 +115,39 @@ def fidelity_loss(pred_state, true_state):
     """1 - |<true|pred>|^2 (paper Eq. 22), mean over batch."""
     return (1 - fidelity(true_state, pred_state)).mean()
 
+class ConditioningNetwork(nn.Module):
+    """Small GRU over the last L normalized modal states -> h_t (spec 2.3)."""
+
+    def __init__(self, m=M_MODES, hidden=GRU_HIDDEN):
+        super().__init__()
+        self.gru = nn.GRU(2 * m, hidden, batch_first=True)
+
+    @staticmethod
+    def _feats(r):                       # [B,L,M] complex -> [B,L,2M] real
+        return torch.cat([r.real, r.imag], dim=-1)
+
+    def forward(self, r_hist):
+        _, h = self.gru(self._feats(r_hist))
+        return h[0]                      # [B, hidden]
+
+class Forecaster(nn.Module): # uses linear regression and past log E_t values to predict the log E_t+1 value
+    def __init__(self, entangler="zz", n_layers=PQC_LAYERS, pairs=None):
+        super().__init__()
+        self.cond = ConditioningNetwork()
+        self.pqc = build_ansatz(n_layers=n_layers, entangler=entangler, pairs=pairs)
+        self.e_head = nn.Linear(GRU_HIDDEN + 1, 1)
+
+    def forward(self, r_hist, e_hist, horizon): # r fourier nodes, e Energy.
+        ''' Energy don't go through Ansatz as quantum gates are unitary transforms, so Quantum circuits cannot change the overall magnitude of a state'''
+
+        preds_r, preds_e = [], []
+        for _ in range(horizon):
+            h = self.cond(r_hist)
+            psi = self.pqc(r_hist[:, -1], h)
+            log_e = self.e_head(torch.cat([h, e_hist[:, -1]], 1)).squeeze(1)
+
+            preds_r.append(psi)
+            preds_e.append(log_e)
+            r_hist = torch.cat([r_hist[:, 1:], psi.unsqueeze(1)], 1)  # slide window
+            e_hist = torch.cat([e_hist[:, 1:], log_e.unsqueeze(1)], 1)
+        return torch.stack(preds_r, 1), torch.stack(preds_e, 1)
